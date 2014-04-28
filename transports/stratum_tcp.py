@@ -234,10 +234,10 @@ class TcpServer(threading.Thread):
                         data = s.recv(self.buffer_size)
                     except ssl.SSLError as x:
                         if x.args[0] == ssl.SSL_ERROR_WANT_READ: 
-                            # print_log("error want read", x, fd)
-                            continue 
-                        else: 
-                            raise x
+                            pass
+                        else:
+                            print_log("SSL error", x)
+                        continue 
                     except socket.error as x:
                         # print_log("recv err", x)
                         stop_session(fd)
