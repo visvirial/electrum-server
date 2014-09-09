@@ -10,6 +10,9 @@ import threading
 import traceback
 import urllib
 
+from calendar import timegm
+from time import strptime
+
 from backends.bitcoind import deserialize
 from processor import Processor, print_log
 from utils import *
@@ -124,12 +127,18 @@ class BlockchainProcessor(Processor):
 
 
     def block2header(self, b):
+        if isinstance(b.get('time'), int):
+            timestamp = b.get('time')
+        else:
+            # Try to parse PPcoin time format
+            timestamp = timegm(strptime(b.get('time'), "%Y-%m-%d %H:%M:%S %Z"))
+
         return {
             "block_height": b.get('height'),
             "version": b.get('version'),
             "prev_block_hash": b.get('previousblockhash'),
             "merkle_root": b.get('merkleroot'),
-            "timestamp": b.get('time'),
+            "timestamp": timestamp,
             "bits": int(b.get('bits'), 16),
             "nonce": b.get('nonce'),
         }
