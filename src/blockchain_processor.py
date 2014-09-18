@@ -281,6 +281,14 @@ class BlockchainProcessor(Processor):
         return v
 
 
+    def get_unconfirmed_history(self, addr):
+        utx = []
+        with self.mempool_lock:
+            for hist in self.mempool_hist.get(addr, []):
+                utx.append(hist)
+        return utx
+
+
     def get_status(self, addr, cache_only=False):
         tx_points = self.get_history(addr, cache_only)
         if cache_only and tx_points == -1:
@@ -492,7 +500,7 @@ class BlockchainProcessor(Processor):
 
         elif method == 'blockchain.address.get_mempool':
             address = str(params[0])
-            result = self.get_unconfirmed_history(address, cache_only)
+            result = self.get_unconfirmed_history(address)
 
         elif method == 'blockchain.address.get_balance':
             address = str(params[0])
