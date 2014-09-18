@@ -7,15 +7,13 @@ import random
 import sys
 import time
 import threading
-import traceback
 import urllib
 
-from backends.bitcoind import deserialize
+import deserialize
 from processor import Processor, print_log
 from utils import *
-
 from storage import Storage
-
+from utils import logger
 
 class BlockchainProcessor(Processor):
 
@@ -33,10 +31,11 @@ class BlockchainProcessor(Processor):
         self.watched_addresses = {}
 
         self.history_cache = {}
+        self.max_cache_size = 100000
         self.chunk_cache = {}
         self.cache_lock = threading.Lock()
         self.headers_data = ''
-        self.headers_path = config.get('leveldb', 'path_fulltree')
+        self.headers_path = config.get('leveldb', 'path')
 
         self.mempool_values = {}
         self.mempool_addresses = {}
@@ -55,19 +54,10 @@ class BlockchainProcessor(Processor):
         self.dblock = threading.Lock()
 
         self.bitcoind_url = 'http://%s:%s@%s:%s/' % (
-            config.get('bitcoind', 'user'),
-            config.get('bitcoind', 'password'),
-            config.get('bitcoind', 'host'),
-            config.get('bitcoind', 'port'))
-
-        while True:
-            try:
-                self.bitcoind('getinfo')
-                break
-            except:
-                print_log('cannot contact bitcoind...')
-                time.sleep(5)
-                continue
+            config.get('bitcoind', 'bitcoind_user'),
+            config.get('bitcoind', 'bitcoind_password'),
+            config.get('bitcoind', 'bitcoind_host'),
+            config.get('bitcoind', 'bitcoind_port'))
 
         self.sent_height = 0
         self.sent_header = None
@@ -75,21 +65,25 @@ class BlockchainProcessor(Processor):
         # catch_up headers
         self.init_headers(self.storage.height)
 
-        threading.Timer(0, lambda: self.catch_up(sync=False)).start()
-        while not shared.stopped() and not self.up_to_date:
-            try:
-                time.sleep(1)
-            except:
-                print "keyboard interrupt: stopping threads"
-                shared.stop()
-                sys.exit(0)
+        self.blockchain_thread = threading.Thread(target = self.do_catch_up)
+        self.blockchain_thread.start()
 
+
+    def do_catch_up(self):
+
+        self.header = self.block2header(self.bitcoind('getblock', [self.storage.last_hash]))
+        self.header['utxo_root'] = self.storage.get_root_hash().encode('hex')
+        self.catch_up(sync=False)
         print_log("Blockchain is up to date.")
         self.memorypool_update()
         print_log("Memory pool initialized.")
 
-        self.timer = threading.Timer(10, self.main_iteration)
-        self.timer.start()
+        while not self.shared.stopped():
+            self.main_iteration()
+            if self.shared.paused():
+                print_log("bitcoind is responding")
+                self.shared.unpause()
+            time.sleep(10)
 
 
 
@@ -110,12 +104,18 @@ class BlockchainProcessor(Processor):
 
     def bitcoind(self, method, params=[]):
         postdata = dumps({"method": method, 'params': params, 'id': 'jsonrpc'})
-        try:
-            respdata = urllib.urlopen(self.bitcoind_url, postdata).read()
-        except:
-            print_log("error calling bitcoind")
-            traceback.print_exc(file=sys.stdout)
-            self.shared.stop()
+        while True:
+            try:
+                respdata = urllib.urlopen(self.bitcoind_url, postdata).read()
+                break
+            except:
+                print_log("cannot reach bitcoind...")
+                self.shared.pause()
+                time.sleep(10)
+                if self.shared.stopped():
+                    # this will end the thread
+                    raise
+                continue
 
         r = loads(respdata)
         if r['error'] is not None:
@@ -258,29 +258,17 @@ class BlockchainProcessor(Processor):
             return -1
 
         with self.dblock:
-            try:
-                hist = self.storage.get_history(addr)
-                is_known = True
-            except:
-                print_log("error get_history")
-                traceback.print_exc(file=sys.stdout)
-                raise
-            if hist:
-                is_known = True
-            else:
-                hist = []
-                is_known = False
+            hist = self.storage.get_history(addr)
 
         # add memory pool
         with self.mempool_lock:
             for txid, delta in self.mempool_hist.get(addr, []):
                 hist.append({'tx_hash':txid, 'height':0})
 
-        # add something to distinguish between unused and empty addresses
-        if hist == [] and is_known:
-            hist = ['*']
-
         with self.cache_lock:
+            if len(self.history_cache) > self.max_cache_size:
+                logger.info("clearing cache")
+                self.history_cache.clear()
             self.history_cache[addr] = hist
         return hist
 
@@ -425,9 +413,18 @@ class BlockchainProcessor(Processor):
 
 
     def add_request(self, session, request):
-        # see if we can get if from cache. if not, add to queue
-        if self.process(session, request, cache_only=True) == -1:
+        # see if we can get if from cache. if not, add request to queue
+        message_id = request.get('id')
+        try:
+            result = self.process(request, cache_only=True)
+        except BaseException as e:
+            self.push_response(session, {'id': message_id, 'error': str(e)})
+            return 
+
+        if result == -1:
             self.queue.put((session, request))
+        else:
+            self.push_response(session, {'id': message_id, 'result': result})
 
 
     def do_subscribe(self, method, params, session):
@@ -471,7 +468,7 @@ class BlockchainProcessor(Processor):
                     self.watched_addresses.pop(addr)
 
 
-    def process(self, session, request, cache_only=False):
+    def process(self, request, cache_only=False):
         
         message_id = request['id']
         method = request['method']
@@ -486,86 +483,50 @@ class BlockchainProcessor(Processor):
             result = self.header
 
         elif method == 'blockchain.address.subscribe':
-            try:
-                address = str(params[0])
-                result = self.get_status(address, cache_only)
-            except BaseException, e:
-                error = str(e) + ': ' + address
-                print_log("error:", error)
+            address = str(params[0])
+            result = self.get_status(address, cache_only)
 
         elif method == 'blockchain.address.get_history':
-            try:
-                address = str(params[0])
-                result = self.get_history(address, cache_only)
-            except BaseException, e:
-                error = str(e) + ': ' + address
-                print_log("error:", error)
+            address = str(params[0])
+            result = self.get_history(address, cache_only)
 
         elif method == 'blockchain.address.get_mempool':
-            try:
-                address = str(params[0])
-                result = self.get_unconfirmed_history(address, cache_only)
-            except BaseException, e:
-                error = str(e) + ': ' + address
-                print_log("error:", error)
+            address = str(params[0])
+            result = self.get_unconfirmed_history(address, cache_only)
 
         elif method == 'blockchain.address.get_balance':
-            try:
-                address = str(params[0])
-                confirmed = self.storage.get_balance(address)
-                unconfirmed = self.get_unconfirmed_value(address)
-                result = { 'confirmed':confirmed, 'unconfirmed':unconfirmed }
-            except BaseException, e:
-                error = str(e) + ': ' + address
-                print_log("error:", error)
+            address = str(params[0])
+            confirmed = self.storage.get_balance(address)
+            unconfirmed = self.get_unconfirmed_value(address)
+            result = { 'confirmed':confirmed, 'unconfirmed':unconfirmed }
 
         elif method == 'blockchain.address.get_proof':
-            try:
-                address = str(params[0])
-                result = self.storage.get_proof(address)
-            except BaseException, e:
-                error = str(e) + ': ' + address
-                print_log("error:", error)
+            address = str(params[0])
+            result = self.storage.get_proof(address)
 
         elif method == 'blockchain.address.listunspent':
-            try:
-                address = str(params[0])
-                result = self.storage.listunspent(address)
-            except BaseException, e:
-                error = str(e) + ': ' + address
-                print_log("error:", error)
+            address = str(params[0])
+            result = self.storage.listunspent(address)
 
         elif method == 'blockchain.utxo.get_address':
-            try:
-                txid = str(params[0])
-                pos = int(params[1])
-                txi = (txid + int_to_hex(pos, 4)).decode('hex')
-                result = self.storage.get_address(txi)
-            except BaseException, e:
-                error = str(e)
-                print_log("error:", error, params)
+            txid = str(params[0])
+            pos = int(params[1])
+            txi = (txid + int_to_hex(pos, 4)).decode('hex')
+            result = self.storage.get_address(txi)
 
         elif method == 'blockchain.block.get_header':
             if cache_only:
                 result = -1
             else:
-                try:
-                    height = int(params[0])
-                    result = self.get_header(height)
-                except BaseException, e:
-                    error = str(e) + ': %d' % height
-                    print_log("error:", error)
+                height = int(params[0])
+                result = self.get_header(height)
 
         elif method == 'blockchain.block.get_chunk':
             if cache_only:
                 result = -1
             else:
-                try:
-                    index = int(params[0])
-                    result = self.get_chunk(index)
-                except BaseException, e:
-                    error = str(e) + ': %d' % index
-                    print_log("error:", error)
+                index = int(params[0])
+                result = self.get_chunk(index)
 
         elif method == 'blockchain.transaction.broadcast':
             try:
@@ -580,32 +541,25 @@ class BlockchainProcessor(Processor):
             if cache_only:
                 result = -1
             else:
-                try:
-                    tx_hash = params[0]
-                    tx_height = params[1]
-                    result = self.get_merkle(tx_hash, tx_height)
-                except BaseException, e:
-                    error = str(e) + ': ' + repr(params)
-                    print_log("get_merkle error:", error)
+                tx_hash = params[0]
+                tx_height = params[1]
+                result = self.get_merkle(tx_hash, tx_height)
 
         elif method == 'blockchain.transaction.get':
-            try:
-                tx_hash = params[0]
-                result = self.bitcoind('getrawtransaction', [tx_hash, 0])
-            except BaseException, e:
-                error = str(e) + ': ' + repr(params)
-                print_log("tx get error:", error)
+            tx_hash = params[0]
+            result = self.bitcoind('getrawtransaction', [tx_hash, 0])
+
+        elif method == 'blockchain.estimatefee':
+            num = int(params[0])
+            result = self.bitcoind('estimatefee', [num])
 
         else:
-            error = "unknown method:%s" % method
+            raise BaseException("unknown method:%s" % method)
 
         if cache_only and result == -1:
             return -1
 
-        if error:
-            self.push_response(session, {'id': message_id, 'error': error})
-        elif result != '':
-            self.push_response(session, {'id': message_id, 'result': result})
+        return result
 
 
     def getfullblock(self, block_hash):
@@ -625,8 +579,7 @@ class BlockchainProcessor(Processor):
         try:
             respdata = urllib.urlopen(self.bitcoind_url, postdata).read()
         except:
-            print_log("bitcoind error (getfullblock)")
-            traceback.print_exc(file=sys.stdout)
+            logger.error("bitcoind error (getfullblock)",exc_info=True)
             self.shared.stop()
 
         r = loads(respdata)
@@ -821,7 +774,7 @@ class BlockchainProcessor(Processor):
 
     
     def close(self):
-        self.timer.join()
+        self.blockchain_thread.join()
         print_log("Closing database...")
         self.storage.close()
         print_log("Database is closed")
@@ -872,7 +825,4 @@ class BlockchainProcessor(Processor):
                         'params': [addr, status],
                         })
 
-        # next iteration 
-        self.timer = threading.Timer(10, self.main_iteration)
-        self.timer.start()
 

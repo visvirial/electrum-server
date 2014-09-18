@@ -22,19 +22,32 @@ import socket
 import sys
 import time
 import threading
-import traceback
-
 import json
 import os
+import imp
 
-import utils
-from backends.bitcoind import storage, networks
+
+if os.path.dirname(os.path.realpath(__file__)) == os.getcwd():
+    imp.load_module('electrumserver', *imp.find_module('src'))
+  
+
+from electrumserver import storage, networks, utils
+from electrumserver.processor import Dispatcher, print_log
+from electrumserver.server_processor import ServerProcessor
+from electrumserver.blockchain_processor import BlockchainProcessor
+from electrumserver.stratum_tcp import TcpServer
+from electrumserver.stratum_http import HttpServer
+
 
 logging.basicConfig()
 
 if sys.maxsize <= 2**32:
     print "Warning: it looks like you are using a 32bit system. You may experience crashes caused by mmap"
 
+if os.getuid() == 0:
+    print "Do not run this program as root!"
+    print "Run the install script to create a non-privileged user."
+    sys.exit()
 
 def attempt_read_config(config, filename):
     try:
@@ -43,6 +56,12 @@ def attempt_read_config(config, filename):
     except IOError:
         pass
 
+def load_banner(config):
+    try:
+        with open(config.get('server', 'banner_file'), 'r') as f:
+            config.set('server', 'banner', f.read())
+    except IOError:
+        pass
 
 def setup_network_params(config):
     type = config.get('network', 'type')
@@ -63,13 +82,14 @@ def create_config(filename=None):
     # set some defaults, which will be overwritten by the config file
     config.add_section('server')
     config.set('server', 'banner', 'Welcome to Electrum!')
+    config.set('server', 'banner_file', '/etc/electrum.banner')
     config.set('server', 'host', 'localhost')
     config.set('server', 'electrum_rpc_port', '8000')
     config.set('server', 'report_host', '')
     config.set('server', 'stratum_tcp_port', '50001')
-    config.set('server', 'stratum_http_port', '8081')
+    config.set('server', 'stratum_http_port', '')
     config.set('server', 'stratum_tcp_ssl_port', '50002')
-    config.set('server', 'stratum_http_ssl_port', '8082')
+    config.set('server', 'stratum_http_ssl_port', '')
     config.set('server', 'report_stratum_tcp_port', '')
     config.set('server', 'report_stratum_http_port', '')
     config.set('server', 'report_stratum_tcp_ssl_port', '')
@@ -80,12 +100,11 @@ def create_config(filename=None):
     config.set('server', 'irc', 'no')
     config.set('server', 'irc_nick', '')
     config.set('server', 'coin', '')
-    config.set('server', 'datadir', '')
+    config.set('server', 'logfile', '/var/log/electrum.log')
+    config.set('server', 'donation_address', '')
 
-    # use leveldb as default
-    config.set('server', 'backend', 'leveldb')
     config.add_section('leveldb')
-    config.set('leveldb', 'path_fulltree', '/dev/shm/electrum_db')
+    config.set('leveldb', 'path', '/dev/shm/electrum_db')
     config.set('leveldb', 'pruning_limit', '100')
 
     # set network parameters
@@ -105,11 +124,7 @@ def create_config(filename=None):
 
     attempt_read_config(config, filename)
 
-    try:
-        with open('/etc/electrum.banner', 'r') as f:
-            config.set('server', 'banner', f.read())
-    except IOError:
-        pass
+    load_banner(config)
 
     return config
 
@@ -120,8 +135,7 @@ def run_rpc_command(params, electrum_rpc_port):
     server = xmlrpclib.ServerProxy('http://localhost:%d' % electrum_rpc_port)
     func = getattr(server, cmd)
     r = func(*params[1:])
-
-    if cmd == 'info':
+    if cmd == 'sessions':
         now = time.time()
         print 'type           address         sub  version  time'
         for item in r:
@@ -132,10 +146,23 @@ def run_rpc_command(params, electrum_rpc_port):
                                                    (now - item.get('time')),
                                                    )
     else:
-        print r
+        print json.dumps(r, indent=4, sort_keys=True)
 
 
-def cmd_info():
+def cmd_banner_update():
+    load_banner(dispatcher.shared.config)
+    return True
+
+def cmd_getinfo():
+    return {
+        'blocks': chain_proc.storage.height,
+        'peers': len(server_proc.peers),
+        'sessions': len(dispatcher.request_dispatcher.get_sessions()),
+        'watched': len(chain_proc.watched_addresses),
+        'cached': len(chain_proc.history_cache),
+        }
+
+def cmd_sessions():
     return map(lambda s: {"time": s.time,
                           "name": s.name,
                           "address": s.address,
@@ -143,11 +170,17 @@ def cmd_info():
                           "subscriptions": len(s.subscriptions)},
                dispatcher.request_dispatcher.get_sessions())
 
+def cmd_numsessions():
+    return len(dispatcher.request_dispatcher.get_sessions())
+
+def cmd_peers():
+    return server_proc.peers.keys()
+
+def cmd_numpeers():
+    return len(server_proc.peers)
+
 def cmd_debug(s):
     if s:
-        from guppy import hpy
-        h = hpy()
-        bp = dispatcher.request_dispatcher.processors['blockchain']
         try:
             result = str(eval(s))
         except:
@@ -168,6 +201,8 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     config = create_config(args.conf)
+    logfile = config.get('server', 'logfile')
+    utils.init_logger(logfile)
     password = config.get('server', 'password')
     host = config.get('server', 'host')
     electrum_rpc_port = get_port(config, 'electrum_rpc_port')
@@ -180,8 +215,9 @@ if __name__ == '__main__':
 
     setup_network_params(config)
 
-    if stratum_tcp_ssl_port or stratum_http_ssl_port:
-        assert ssl_certfile and ssl_keyfile
+    if ssl_certfile is '' or ssl_keyfile is '':
+        stratum_tcp_ssl_port = None
+        stratum_http_ssl_port = None
 
     if len(args.command) >= 1:
         try:
@@ -202,21 +238,6 @@ if __name__ == '__main__':
         sys.exit(1)
 
 
-    from processor import Dispatcher, print_log
-    from backends.irc import ServerProcessor
-    from transports.stratum_tcp import TcpServer
-    from transports.stratum_http import HttpServer
-
-    backend_name = config.get('server', 'backend')
-    if backend_name == 'libbitcoin':
-        from backends.libbitcoin import BlockchainProcessor
-    elif backend_name == 'leveldb':
-        from backends.bitcoind import BlockchainProcessor
-    else:
-        print "Unknown backend '%s' specified\n" % backend_name
-        sys.exit(1)
-
-    print "\n\n\n\n\n"
     print_log("Starting Electrum server on", host)
 
     # Create hub
@@ -236,7 +257,7 @@ if __name__ == '__main__':
     chain_proc = BlockchainProcessor(config, shared)
     dispatcher.register('blockchain', chain_proc)
 
-    server_proc = ServerProcessor(config)
+    server_proc = ServerProcessor(config, shared)
     dispatcher.register('server', server_proc)
 
     transports = []
@@ -266,8 +287,13 @@ if __name__ == '__main__':
     server = SimpleXMLRPCServer(('localhost', electrum_rpc_port), allow_none=True, logRequests=False)
     server.register_function(lambda: os.getpid(), 'getpid')
     server.register_function(shared.stop, 'stop')
-    server.register_function(cmd_info, 'info')
+    server.register_function(cmd_getinfo, 'getinfo')
+    server.register_function(cmd_sessions, 'sessions')
+    server.register_function(cmd_numsessions, 'numsessions')
+    server.register_function(cmd_peers, 'peers')
+    server.register_function(cmd_numpeers, 'numpeers')
     server.register_function(cmd_debug, 'debug')
+    server.register_function(cmd_banner_update, 'banner_update')
     server.socket.settimeout(1)
  
     while not shared.stopped():
