@@ -581,14 +581,16 @@ class BlockchainProcessor(Processor):
                 logger.error("bitcoind error (getfullblock)",exc_info=True)
                 self.shared.stop()
 
-            r = loads(respdata)
+            ir = loads(respdata)
 
-            for ir in r:
-                if ir['error'] is not None:
-                    self.shared.stop()
-                    print_log("Error: make sure you run bitcoind with txindex=1; use -reindex if needed.")
-                    raise BaseException(ir['error'])
-                rawtxdata.append(ir['result'])
+            if ir['error'] is not None:
+                if ir['error']['code'] == -5: # walkaround namecoin not
+                    print_log("Error: could not find tx", txid, "skipping...")
+                    continue
+                self.shared.stop()
+                print_log("Error: make sure you run bitcoind with txindex=1; use -reindex if needed.")
+                raise BaseException(ir['error'])
+            rawtxdata.append(ir['result'])
 
         block['tx'] = rawtxdata
         return block
