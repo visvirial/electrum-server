@@ -130,7 +130,7 @@ class BlockchainProcessor(Processor):
             "prev_block_hash": b.get('previousblockhash'),
             "merkle_root": b.get('merkleroot'),
             "timestamp": b.get('time'),
-            "bits": int(b.get('bits'), 16),
+            "bits": b.get('bits'), # Namecoin RPC give the bits value directly as an int
             "nonce": b.get('nonce'),
         }
 
