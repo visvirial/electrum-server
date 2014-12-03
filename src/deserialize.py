@@ -361,29 +361,30 @@ def get_address_from_input_script(bytes):
     if match_decoded(decoded, match):
         return None, None, public_key_to_pubkey_address(decoded[1][1])
 
-    # p2sh transaction, 2 of n
-    match = [ opcodes.OP_0 ]
-    while len(match) < len(decoded):
-        match.append(opcodes.OP_PUSHDATA4)
-
-    if match_decoded(decoded, match):
-
-        redeemScript = decoded[-1][1]
-        num = len(match) - 2
-        signatures = map(lambda x:x[1].encode('hex'), decoded[1:-1])
-        dec2 = [ x for x in script_GetOp(redeemScript) ]
-
-        # 2 of 2
-        match2 = [ opcodes.OP_2, opcodes.OP_PUSHDATA4, opcodes.OP_PUSHDATA4, opcodes.OP_2, opcodes.OP_CHECKMULTISIG ]
-        if match_decoded(dec2, match2):
-            pubkeys = [ dec2[1][1].encode('hex'), dec2[2][1].encode('hex') ]
-            return pubkeys, signatures, hash_160_to_script_address(hash_160(redeemScript))
-
-        # 2 of 3
-        match2 = [ opcodes.OP_2, opcodes.OP_PUSHDATA4, opcodes.OP_PUSHDATA4, opcodes.OP_PUSHDATA4, opcodes.OP_3, opcodes.OP_CHECKMULTISIG ]
-        if match_decoded(dec2, match2):
-            pubkeys = [ dec2[1][1].encode('hex'), dec2[2][1].encode('hex'), dec2[3][1].encode('hex') ]
-            return pubkeys, signatures, hash_160_to_script_address(hash_160(redeemScript))
+    # Namecoin does not have p2sh addresses yet
+    # # p2sh transaction, 2 of n
+    # match = [ opcodes.OP_0 ]
+    # while len(match) < len(decoded):
+    #     match.append(opcodes.OP_PUSHDATA4)
+    #
+    # if match_decoded(decoded, match):
+    #
+    #     redeemScript = decoded[-1][1]
+    #     num = len(match) - 2
+    #     signatures = map(lambda x:x[1].encode('hex'), decoded[1:-1])
+    #     dec2 = [ x for x in script_GetOp(redeemScript) ]
+    #
+    #     # 2 of 2
+    #     match2 = [ opcodes.OP_2, opcodes.OP_PUSHDATA4, opcodes.OP_PUSHDATA4, opcodes.OP_2, opcodes.OP_CHECKMULTISIG ]
+    #     if match_decoded(dec2, match2):
+    #         pubkeys = [ dec2[1][1].encode('hex'), dec2[2][1].encode('hex') ]
+    #         return pubkeys, signatures, hash_160_to_script_address(hash_160(redeemScript))
+    #
+    #     # 2 of 3
+    #     match2 = [ opcodes.OP_2, opcodes.OP_PUSHDATA4, opcodes.OP_PUSHDATA4, opcodes.OP_PUSHDATA4, opcodes.OP_3, opcodes.OP_CHECKMULTISIG ]
+    #     if match_decoded(dec2, match2):
+    #         pubkeys = [ dec2[1][1].encode('hex'), dec2[2][1].encode('hex'), dec2[3][1].encode('hex') ]
+    #         return pubkeys, signatures, hash_160_to_script_address(hash_160(redeemScript))
 
     return [], [], None
 
@@ -417,10 +418,11 @@ def get_address_from_output_script(bytes):
     if match_decoded(decoded, match):
         return hash_160_to_pubkey_address(decoded[2][1])
 
-    # p2sh
-    match = [ opcodes.OP_HASH160, opcodes.OP_PUSHDATA4, opcodes.OP_EQUAL ]
-    if match_decoded(decoded, match):
-        addr = hash_160_to_script_address(decoded[1][1])
-        return addr
+    # Namecoin does not have p2sh addresses yet
+    # # p2sh
+    # match = [ opcodes.OP_HASH160, opcodes.OP_PUSHDATA4, opcodes.OP_EQUAL ]
+    # if match_decoded(decoded, match):
+    #     addr = hash_160_to_script_address(decoded[1][1])
+    #     return addr
 
     return None
